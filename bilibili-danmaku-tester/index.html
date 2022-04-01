@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>弹幕测试器</title>
+    <script src="https://cdn.staticfile.org/pako/2.0.4/pako.min.js"></script>
+    <script>
+        const Operation = Object.freeze({
+            HANDSHAKE: 0,
+            HANDSHAKE_REPLY: 1,
+            HEARTBEAT: 2,
+            HEARTBEAT_REPLY: 3,
+            SEND_MSG: 4,
+            SEND_MSG_REPLY: 5,
+            DISCONNECTED_REPLY: 6,
+            AUTH: 7,
+            AUTH_REPLY: 8,
+            RAW: 9
+        });
+
+        const Protocol = Object.freeze({
+            JSON: 0,
+            HEARTBEAT: 1,
+            ZLIB: 2,
+            BROTLI: 3
+        })
+
+        class DanmakuClient {
+            constructor() {
+                this.roomID = undefined;
+                this.socket = undefined;
+                this.encoder = new TextEncoder();
+                this.decoder = new TextDecoder();
+                this.heartbeatTimer = undefined;
+                this.handlers = [];
+            }
+
+            addHandler(handler) {
+                this.handlers.push(handler);
+            }
+
+            removeHandler(handler) {
+                let index = this.handlers.indexOf(handler);
+                if (index >= 0) {                
+                    this.handlers.pop(index);
+                }
+            }
+
+            pack(data, operation) {
+                let body = this.encoder.encode(JSON.stringify(data));
+                let headerBuffer = new ArrayBuffer(16);
+                let view = new DataView(headerBuffer);
+                view.setUint32(0, 16 + body.byteLength, false);
+                view.setUint16(4, 16, false);
+                view.setUint16(6, 1, false);
+                view.setUint32(8, operation, false);
+                view.setUint32(12, 1, false);
+                let newBuffer = new Uint8Array(16 + body.byteLength);
+                newBuffer.set(new Uint8Array(headerBuffer));
+                newBuffer.set(body, 16);
+                return newBuffer;
+            }
+
+            start(roomID) {
+                this.roomID = roomID;
+                this.socket = new WebSocket('wss://broadcastlv.chat.bilibili.com/sub');
+                this.socket.addEventListener('open', this.onOpened.bind(this));
+                this.socket.addEventListener('close', this.onClosed.bind(this));
+                this.socket.addEventListener('error', this.onError.bind(this));
+                this.socket.addEventListener('message', this.onMessage.bind(this));
+
+                this.heartbeatTimer = setInterval(this.heartbeatWorker.bind(this), 10000);
+            }
+            
+            stop() {
+                this.roomID = undefined;
+                this.handlers = [];
+                this.socket.close(1000);
+                this.socket = undefined;
+            }
+
+            onOpened(event) {
+                this.socket.send(this.pack({
+                    uid: 0,
+                    roomid: this.roomID,
+                    protoover: 2,
+                    platform: 'web',
+                    type: 2,
+                    clientver: '1.8.5'
+                }, Operation.AUTH));
+            }
+
+            onClosed(event) {
+                if (event.code !== 1000) {
+                    // retry login
+                    this.socket = new WebSocket('wss://broadcastlv.chat.bilibili.com/sub');
+                    this.socket.addEventListener('open', this.onOpened.bind(this));
+                    this.socket.addEventListener('close', this.onClosed.bind(this));
+                    this.socket.addEventListener('error', this.onError.bind(this));
+                    this.socket.addEventListener('message', this.onMessage.bind(this));
+
+                    this.heartbeatTimer = setInterval(this.heartbeatWorker.bind(this), 10000);
+                }
+            }
+
+            onError(event) {
+                console.log('error');
+            }
+
+            processMessage(message) {
+                let baseOffset = 0;
+                let view = new DataView(message);
+                let u8arr = new Uint8Array(message);
+
+                while (baseOffset + 12 < message.byteLength) {
+                    let header = {
+                        totalSize: view.getUint32(baseOffset, false),
+                        headerSize: view.getUint16(baseOffset + 4, false),
+                        protocol: view.getUint16(baseOffset + 6, false),
+                        operation: view.getUint32(baseOffset + 8, false)
+                    };
+
+                    let body = u8arr.slice(baseOffset + header.headerSize, baseOffset + header.totalSize);
+
+                    baseOffset += header.totalSize;
+
+                    switch (header.operation) {
+                        case Operation.AUTH_REPLY:
+                        case Operation.SEND_MSG_REPLY:
+                            this.processBusinessMessage(header, body);
+                            break;
+                        case Operation.HEARTBEAT_REPLY:
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+
+            processBusinessMessage(header, body) {
+                switch (header.operation) {
+                    case Operation.SEND_MSG_REPLY:
+                        switch (header.protocol) {
+                            case Protocol.BROTLI:
+                                console.log('brotli unsupported');
+                                break;
+                            case Protocol.ZLIB:
+                                this.processMessage(pako.inflate(body).buffer);
+                                break;
+                            case Protocol.JSON: {
+                                let data = this.decoder.decode(body);
+                                this.processJSONMessage(JSON.parse(data));
+                                break;
+                            }
+                        }
+                        break;
+                    case Operation.AUTH_REPLY: {
+                        let data = this.decoder.decode(body);
+                        data = JSON.parse(data);
+                        if (data.code !== 0) {
+                            console.log('failed');
+                            return;
+                        }
+                        console.log('auth succeed');
+                        this.socket.send(this.pack({}, Operation.HEARTBEAT));
+                    }
+                    default:
+                        break;
+                }
+            }
+
+            processJSONMessage(data) {
+                for (let handler of this.handlers) {
+                    handler(data);
+                }
+            }
+
+            async onMessage(event) {
+                let type = this.socket.binaryType;
+                if (type == 'blob') {
+                    let buffer = await event.data.arrayBuffer();
+                    this.processMessage(buffer);
+                } else {
+                    
+                }
+            }
+
+            get running() {
+                return this.socket && this.socket.readyState < WebSocket.CLOSING;
+            }
+
+            heartbeatWorker() {
+                if (this.running) {
+                    this.socket.send(this.pack({}, Operation.HEARTBEAT));
+                } else {
+                    clearInterval(this.heartbeatTimer);
+                    this.heartbeatTimer = undefined;
+                }
+            }
+        }
+    </script>
+    <script>
+        const match = (rule, danmaku) => {
+            switch (rule.type) {
+                case 'and':
+                    for (let subRule of rule.rules) {
+                        if (!match(subRule, danmaku)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                case 'or':
+                    for (let subRule of rule.rules) {
+                        if (match(subRule, danmaku)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                case 'sender': {
+                    let result = rule.rule == danmaku.userId;
+                    return rule.inverse ? !result : result;
+                }
+                case 'content':
+                    try {
+                        let result = RegExp(rule.rule).test(danmaku.content);
+                        return rule.inverse ? !result : result;
+                    } catch (e) {
+                        return false;
+                    }
+            }
+        };
+
+        const describeRule = rule => {
+            switch (rule.type) {
+                case 'sender':
+                    return `发送者ID${rule.inverse ? '不' : ''}是${rule.rule}`;
+                case 'content':
+                    return `弹幕内容${rule.inverse ? '不' : ''}匹配/${rule.rule}/`;
+                case 'and': {
+                    return `(${rule.rules.map(describeRule).join(' 并且 ')})`;
+                }
+                case 'or': {
+                    return `(${rule.rules.map(describeRule).join(' 或者 ')})`;
+                }
+            }
+        };
+    </script>
+</head>
+<body>
+    <!-- <script src="https://unpkg.com/vue@3"></script> -->
+    <script src="https://cdn.staticfile.org/vue/3.2.31/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.10.2/Sortable.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vuedraggable@4.1.0/dist/vuedraggable.umd.js"></script>
+    <div id="app" @beforeDanmakuUpdate="beforeDanmakuUpdate" @afterDanmakuUpdate="afterDanmakuUpdate">
+        <header>
+            <div class="header-title">弹幕测试器</div>
+            <div class="input-with-button">
+                <input v-model="roomId" placeholder="直播间ID" class="room-id-input" @keyup.enter.native="onEnsureClicked">
+                <button class="ensure-button" @click="onEnsureClicked">{{ clientRunning ? '停止' : '启动' }}</button>
+            </div>
+        </header>
+        <div class="main">
+            <div class="danmaku-view">
+                <template v-if="danmakuList.length">
+                    <button class="floating-delete-button" @click="clearDanmakuList">清空弹幕列表</button>
+                    <div class="scroll-list" ref="danmakuScroll">
+                        <div class="danmaku-list-inner">
+                            <div v-for="danmaku in danmakuList" class="danmaku-box" :style="danmaku.member ? {background: danmaku.member.style.backgroundColor} : {}">
+                                <div class="danmaku-user">{{ danmaku.user }} ({{ danmaku.userId }})</div>
+                                <div class="danmaku-content" :style="danmaku.member ? {color: danmaku.member.style.fontColor} : {}">{{ danmaku.content }}</div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <div v-else class="notify-text">
+                    弹幕列表为空
+                    <br/>
+                    {{ clientRunning ? '现在貌似没人发弹幕' : '请指定直播间ID并启动' }}
+                </div>
+            </div>
+            <div class="members-view">
+                <template v-if="members.length">
+                    <draggable
+                        :list="members"
+                        :component-data="{
+                            class: 'scroll-list'
+                        }"
+                        :group="{ name: 'members' }"
+                        item-key="order">
+                        <template #item="{element, index}">
+                            <div
+                                class="member-info-box"
+                                @click="selectMember(index)" 
+                                :style="{background: index == selectedIndex ? 'rgba(255, 255, 255, 0.3)' : element.style.backgroundColor }">
+                                <div class="member-name" :style="{ color: element.style.fontColor }">{{ element.name }}</div>
+                                <div class="member-rules">匹配规则：{{ element.rulesDescription }}</div>
+                                <button class="floating-delete-button" @click="deleteMember(index, $event)">删除</button>
+                            </div>
+                        </template>
+                    </draggable>
+                </template>
+                <div v-else class="notify-text">
+                    成员列表为空
+                    <br/>
+                    请点击右下角的(+)添加第一个主播的信息
+                </div>
+                <button class="floating-round-button" @click="addMember">+</button>
+            </div>
+            <div class="settings-view">
+                <div class="settings-view-inner" v-if="selectedMember">
+                    <div class="settings-category">
+                        <div class="category-name">基本信息</div>
+                        <div class="category-content">
+                            <div class="labeled-input">
+                                <div class="labeled-input-label">规则名称</div>
+                                <input class="labeled-input-input" v-model="selectedMember.name">
+                            </div>
+                            <div class="labeled-input">
+                                <div class="labeled-input-label">字体颜色</div>
+                                <input class="colored-input-input" v-model="selectedMember.style.fontColor">
+                                <div class="colored-input-color" :style="{ background: selectedMember.style.fontColor }"></div>
+                            </div>
+                            <div class="labeled-input">
+                                <div class="labeled-input-label">背景颜色</div>
+                                <input class="colored-input-input" v-model="selectedMember.style.backgroundColor">
+                                <div class="colored-input-color" :style="{ background: selectedMember.style.backgroundColor }"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="settings-category" style="flex-grow: 1;">
+                        <button class="floating-apply-button" @click="confirmRules">确认规则并重新匹配</button>
+                        <div class="category-name">匹配规则</div>
+                        <div class="category-content">
+                            <draggable
+                                v-if="selectedMember.rules.length"
+                                :list="selectedMember.rules"
+                                :component-data="{
+                                    class: 'scroll-list'
+                                }"
+                                :group="{ name: 'rules' }"
+                                item-key="id">
+                                <template #item="{element, index}">
+                                    <div class="rule-box-item">
+                                        <match-rule :rule="element" :parent="null" :subIndex="index" :that="this"></match-rule>
+                                    </div>
+                                </template>
+                            </draggable>
+                            <div v-else class="notify-text">
+                                匹配规则为空
+                                <br/>
+                                请点击右下角的(+)以添加一条规则
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div v-else class="notify-text">
+                    未选择主播
+                    <br/>
+                    请在左侧栏内选择一个主播
+                </div>
+                <button v-if="selectedMember" class="floating-round-button" @click="openAddRuleDialog">+</button>
+            </div>
+        </div>
+        <dialog ref="addRuleDialog">
+            <div class="settings-category">
+                <div class="category-name">要添加什么规则？</div>
+                <div class="category-content">
+                    <div class="dialog-big-button" @click="addRule('content')">
+                        <div class="big-button-label">匹配弹幕内容</div>
+                        <div class="big-button-description">使用正则表达式匹配弹幕内容（点击规则名称可以切换匹配/不匹配）</div>
+                    </div>
+                    <div class="dialog-big-button" @click="addRule('sender')">
+                        <div class="big-button-label">匹配弹幕发送者ID</div>
+                        <div class="big-button-description">只有发送者ID与设置的内容完全相同时才会匹配（点击规则名称可以切换匹配/不匹配）</div>
+                    </div>
+                    <div class="dialog-big-button" @click="addRule('and')">
+                        <div class="big-button-label">“并且”规则组</div>
+                        <div class="big-button-description">只有当规则组内的所有规则均匹配时才会被视作匹配</div>
+                    </div>
+                    <div class="dialog-big-button" @click="addRule('or')">
+                        <div class="big-button-label">“或者”规则组</div>
+                        <div class="big-button-description">规则组内的任一规则匹配时就会被视作匹配</div>
+                    </div>
+                    <div class="dialog-big-button" @click="closeAddRuleDialog">
+                        <div class="big-button-label">取消</div>
+                        <div class="big-button-description">不添加任何规则，仅关闭对话框</div>
+                    </div>
+                </div>
+            </div>
+        </dialog>
+    </div>
+    <style>
+        .popup-dialog-background {
+            position: fixed;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .popup-dialog {
+            width: 50vw;
+            height: 50vh;
+            position: fixed;
+            left: 25%;
+            top: 25%;
+        }
+
+        dialog {
+            border-radius: 10px;
+            background-color: #333;
+            border:rgba(255, 255, 255, 0.4) 1px solid;
+            box-shadow: rgba(255, 255, 255, 0.4) 1px 1px 1px 1px;
+        }
+
+        .dialog-content {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .dialog-big-button {
+            display: flex;
+            flex-direction: column;
+            border-radius: 10px;
+            border: rgba(255, 255, 255, 0.4) 1px solid;
+            padding: 10px;
+        }
+
+        .dialog-big-button:hover {
+            background: rgba(255, 255, 255, 0.4);
+        }
+
+        .dialog-big-button:active {
+            background: rgba(255, 255, 255, 0.6);
+        }
+
+        .big-button-label {
+            color: white;
+            font-size: large;
+            font-weight: bold;
+        }
+
+        .big-button-description {
+            color: lightgray;
+            font-size: small;
+        }
+
+        .sortable-ghost {
+            height: 0;
+        }
+
+        .notify-text {
+            color: white;
+            font-size: large;
+            font-weight: bold;
+            text-align: center;
+            align-self: center;
+        }
+
+        .rule-box {
+            display: flex;
+            padding: 10px;
+            border-radius: 10px;
+            box-shadow: rgba(255, 255, 255, 0.2) 1px 1px 2px 0.5px;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            flex-direction: column;
+            margin: 5px;
+            position: relative;
+        }
+
+        .rule-box:hover {
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .rule-box-list {
+            display: flex;
+            flex-direction: column;
+            min-height: 50px;
+        }
+
+        .rule-box-item {
+            display: flex;
+            flex-direction: column;
+            margin: 10px;
+        }
+
+        .rule-input {
+            background-color: transparent;
+            color: white;
+            border-radius: 5px;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+        }
+
+        .rule-checkbox {
+            background-color: transparent;
+            color: white;
+        }
+
+        span {
+            color: white;
+        }
+
+        body {
+            margin: 0;
+        }
+
+        #app {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            max-height: 100vh;
+            background-color: #232323;
+        }
+
+        header {
+            display: flex;
+            flex-direction: row;
+            height: 5vh;
+            justify-content: space-between;
+            background-color: black;
+            box-shadow: black 1px 1px 2px 1px;
+        }
+
+        .header-title {
+            display: flex;
+            align-items: center;
+            margin-left: 15%;
+            color: white;
+            font-size: larger;
+        }
+
+        .input-with-button {
+            display: flex;
+            flex-direction: row;
+            margin-right: 20%;
+            margin-top: 10px;
+            margin-bottom: 10px;
+        }
+
+        .room-id-input {
+            background-color: transparent;
+            color: white;
+            padding-left: 20px;
+            border-radius: 10px 0 0 10px;
+            border: rgba(255, 255, 255, 0.4) 1px solid;
+        }
+
+        .ensure-button {
+            color: white;
+            background-color: rgba(255, 255, 255, 0.4);
+            border: hidden;
+            padding-left: 20px;
+            padding-right: 20px;
+            border-radius: 0 10px 10px 0;
+        }
+
+        .main {
+            display: flex;
+            flex-direction: row;
+            flex-grow: 1;
+        }
+
+        .danmaku-view {
+            display: flex;
+            flex-direction: column;
+            flex: 1 0;
+            justify-content: space-around;
+            position: relative;
+        }
+
+        .danmaku-list-inner {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            row-gap: 10px;
+        }
+
+        .danmaku-box {
+            display: flex;
+            border-radius: 10px;
+            flex-direction: column;
+            padding: 10px;
+            margin: 5px;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            box-shadow: rgba(255, 255, 255, 0.2) 1px 1px 1px 1px;
+        }
+
+        .danmaku-user {
+            color: gray;
+            font-size: small;
+        }
+
+        .danmaku-content {
+            color: white;
+        }
+
+        .settings-view {
+            display: flex;
+            flex-direction: row;
+            flex: 1 0;
+            justify-content: space-around;
+            position: relative;
+        }
+
+        .settings-view-inner {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            padding: 20px;
+            row-gap: 20px;
+        }
+
+        .settings-category {
+            display: flex;
+            flex-direction: column;
+            row-gap: 10px;
+            position: relative;
+        }
+
+        .category-name {
+            color: white;
+        }
+
+        .category-content {
+            display: flex;
+            flex-direction: column;
+            row-gap: 20px;
+            padding: 10px;
+            border-radius: 10px;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            flex-grow: 1;
+        }
+
+        .members-view {
+            display: flex;
+            flex-direction: column;
+            flex: 1 0;
+            justify-content: space-around;
+            position: relative;
+        }
+
+        .member-info-box {
+            display: flex;
+            flex-direction: column;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            box-shadow: rgba(255, 255, 255, 0.2) 1px 1px 1px 1px;
+            position: relative;
+        }
+
+        .member-name {
+            color: white;
+            font-weight: bold;
+            font-size: larger;
+        }
+
+        .member-rules {
+            color:rgba(255, 255, 255, 0.4);
+        }
+
+        .floating-round-button {
+            position: absolute;
+            right: 10px;
+            bottom: 10px;
+            background-color: gray;
+            border: hidden;
+            border-radius: 50%;
+            height: 60px;
+            width: 60px;
+            color: white;
+            font-size: 40px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        .floating-round-button:hover {
+            background-color: lightgray;
+        }
+
+        .floating-round-button:active {
+            background-color: gray;
+        }
+
+        .floating-delete-button {
+            position: absolute;
+            right: 10px;
+            top: 10px;
+            background-color: transparent;
+            border: red 1px solid;
+            color: red;
+            border-radius: 3px;
+        }
+
+        .floating-delete-button:hover {
+            background-color: rgba(255, 0, 0, 0.5);
+        }
+
+        .floating-delete-button:active {
+            background-color: transparent;
+        }
+
+        .floating-apply-button {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background-color: transparent;
+            border: lime 1px solid;
+            color: lime;
+            border-radius: 3px;
+        }
+
+        .floating-apply-button:hover {
+            background-color: rgba(0, 255, 0, 0.5);
+        }
+
+        .floating-apply-button:active {
+            background-color: transparent;
+        }
+
+        .hr {
+            height: 2px;
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .labeled-input {
+            display: flex;
+            flex-direction: row;
+            justify-content: center;
+        }
+
+        .labeled-input-label {
+            border-radius: 10px 0 0 10px;
+            background-color: rgba(255, 255, 255, 0.2);
+            padding: 10px 20px;
+            color: white;
+        }
+
+        .labeled-input-input {
+            border-radius: 0 10px 10px 0;
+            background-color: transparent;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            color: white;
+            font-size: large;
+            flex-grow: 1;
+        }
+
+        .colored-input-input {
+            background-color: transparent;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            color: white;
+            font-size: large;
+            flex-grow: 3;
+        }
+
+        .colored-input-color {
+            border-radius: 0 10px 10px 0;
+            border: rgba(255, 255, 255, 0.2) 1px solid;
+            font-size: large;
+            flex-grow: 3;
+        }
+
+        .scroll-list {
+            overflow-y: scroll;
+            height: 0;
+            display: flex;
+            flex-direction: column;
+            flex-grow: 1;
+        }
+    </style>
+    <script>
+        const draggable = vuedraggable;
+        const client = new DanmakuClient();
+        const app = Vue.createApp({
+            data() {
+                return {
+                    roomId: '',
+                    danmakuList: [],
+                    members: [],
+                    selectedMember: null,
+                    selectedIndex: -1,
+                    clientRunning: false,
+                    currentOrder: 0,
+                    currentRuleId: 0,
+                    dialogOpened: false,
+                    stayAtBottom: true
+                };
+            },
+            methods: {
+                onEnsureClicked() {
+                    if (this.clientRunning) {
+                        client.stop();
+                        this.clientRunning = false;
+                    } else {
+                        let roomId = +this.roomId;
+                        client.addHandler(msg => {
+                            if (msg.cmd == 'DANMU_MSG') {
+                                this.beforeDanmakuUpdate();
+
+                                let user = msg.info[2];
+                                let danmaku = {
+                                    id: this.danmakuList.length,
+                                    user: user[1],
+                                    userId: user[0],
+                                    content: msg.info[1],
+                                    member: null
+                                }
+                                for (let member of this.members) {
+                                    if (match({type: 'or', rules: member.rules}, danmaku)) {
+                                        danmaku.member = member;
+                                        break;
+                                    }
+                                }
+                                this.danmakuList.push(danmaku);
+
+                                this.afterDanmakuUpdate();
+                            }
+                        });
+                        client.start(roomId);
+                        this.clientRunning = true;
+                    }
+                },
+                addMember() {
+                    this.members.push({
+                        order: this.currentOrder,
+                        name: '规则#' + this.currentOrder,
+                        rules: [],
+                        rulesDescription: '空',
+                        style: {
+                            fontColor: 'white',
+                            backgroundColor: 'transparent'
+                        }
+                    });
+                    this.currentOrder ++;
+                },
+                deleteMember(index, event) {
+                    event.cancelBubble = true;
+                    if (index == this.selectedIndex) {
+                        this.selectedIndex = -1;
+                        this.selectedMember = null;
+                    }
+                    let member = this.members[index];
+                    this.members.splice(index, 1);
+                    for (let danmaku of this.danmakuList) {
+                        if (danmaku.member.order == member.order) {
+                            danmaku.member = null;
+                        }
+                    }
+                },
+                selectMember(index) {
+                    this.selectedIndex = index;
+                    this.selectedMember = this.members[index];
+                },
+                addRule(type) {
+                    let ruleId = this.currentRuleId;
+                    switch (type) {
+                        case 'sender':
+                        case 'content':
+                            this.selectedMember.rules.push({
+                                id: ruleId,
+                                type,
+                                rule: ''
+                            });
+                            break;
+                        case 'and':
+                        case 'or':
+                            this.selectedMember.rules.push({
+                                id: ruleId,
+                                type,
+                                rules: []
+                            });
+                            break;
+                    }
+                    this.currentRuleId ++;
+                    this.closeAddRuleDialog();
+                },
+                deleteRule(parent, subIndex, event) {
+                    event.cancelBubble = true;
+                    if (parent) {
+                        parent.rules.splice(subIndex, 1);
+                    } else {
+                        this.selectedMember.rules.splice(subIndex, 1);
+                    }
+                },
+                openAddRuleDialog() {
+                    this.$refs.addRuleDialog.showModal();
+                },
+                closeAddRuleDialog() {
+                    this.$refs.addRuleDialog.close();
+                },
+                confirmRules() {
+                    if (this.selectedMember.rules.length) {
+                        this.selectedMember.rulesDescription = this.selectedMember.rules.map(describeRule).join(' 或者 ');
+                    } else {
+                        this.selectedMember.rulesDescription = '空';
+                    }
+
+                    // rematch all danmaku
+                    this.rematchAllRules();
+                },
+                rematchAllRules() {
+                    for (let danmaku of this.danmakuList) {
+                        danmaku.member = null;
+                        for (let member of this.members) {
+                            if (match({type: 'or', rules: member.rules}, danmaku)) {
+                                danmaku.member = member;
+                                break;
+                            }
+                        }
+                    }
+                },
+                clearDanmakuList() {
+                    this.danmakuList = [];
+                },
+                beforeDanmakuUpdate() {
+                    this.$nextTick(() => {
+                        let element = this.$refs.danmakuScroll;
+                        if (!element) {
+                            return;
+                        }
+                        this.stayAtBottom = Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop) < 1;
+                    });
+                },
+                afterDanmakuUpdate() {
+                    this.$nextTick(() => {
+                        if (this.stayAtBottom) {
+                            this.$refs.danmakuScroll.scroll({
+                                top: this.$refs.danmakuScroll.scrollHeight - this.$refs.danmakuScroll.offsetHeight,
+                                behavior: 'smooth'
+                            });
+                            // this.$refs.danmakuScroll.scrollTop = this.$refs.danmakuScroll.scrollHeight;
+                        }
+                    });
+                }
+            },
+            components: {
+                draggable
+            }
+        });
+
+        app.component('match-rule', {
+            props: {
+                rule: Object,
+                parent: Object,
+                subIndex: Number,
+                that: Object
+            },
+            template: `
+            <and-selector :rule="rule" :parent="parent" :subIndex="subIndex" :that="that" v-if="rule.type === 'and'"></and-selector>
+            <or-selector :rule="rule" :parent="parent" :subIndex="subIndex" :that="that" v-else-if="rule.type === 'or'"></or-selector>
+            <match-content :rule=rule :parent="parent" :subIndex="subIndex" :that="that" v-else-if="rule.type === 'content'"></match-content>
+            <match-sender :rule=rule :parent="parent" :subIndex="subIndex" :that="that" v-else-if="rule.type === 'sender'"></match-sender>`
+        });
+
+        app.component('and-selector', {
+            props: {
+                rule: Object,
+                parent: Object,
+                subIndex: Number,
+                that: Object
+            },
+            components: {
+                draggable
+            },
+            computed: {
+                dragOptions() {
+                    return {
+                        group: {name: 'rules'}
+                    };
+                }
+            },
+            template: `
+            <div class="rule-box">
+                <button class="floating-delete-button" @click="that.deleteRule(parent, subIndex, $event)">删除</button>
+                <span>并且</span>
+                <draggable
+                    :list="rule.rules"
+                    :component-data="{
+                        class: 'rule-box-list'
+                    }"
+                    item-key="id"
+                    v-bind="dragOptions">
+                    <template #item="{element, index}">
+                        <div class="rule-box-item">
+                            <match-rule :rule="element" :parent="rule" :subIndex="index" :that="that"></match-rule>
+                        </div>
+                    </template>
+                </draggable>
+            </div>`
+        });
+
+        app.component('or-selector', {
+            props: {
+                rule: Object,
+                parent: Object,
+                subIndex: Number,
+                that: Object
+            },
+            components: {
+                draggable
+            },
+            computed: {
+                dragOptions() {
+                    return {
+                        group: {name: 'rules'}
+                    };
+                }
+            },
+            template: `
+            <div class="rule-box">
+                <button class="floating-delete-button" @click="that.deleteRule(parent, subIndex, $event)">删除</button>
+                <span>或者</span>
+                <draggable
+                    :list="rule.rules"
+                    :component-data="{
+                        class: 'rule-box-list',
+                    }"
+                    item-key="id"
+                    v-bind="dragOptions">
+                    <template #item="{element, index}">
+                        <div class="rule-box-item">
+                            <match-rule :rule="element" :parent="rule" :subIndex="index" :that="that"></match-rule>
+                        </div>
+                    </template>
+                </draggable>
+            </div>`
+        });
+
+        app.component('match-content', {
+            props: {
+                rule: Object,
+                parent: Object,
+                subIndex: Number,
+                that: Object
+            },
+            template: `
+            <div class="rule-box">
+                <button class="floating-delete-button" @click="that.deleteRule(parent, subIndex, $event)">删除</button>
+                <span @click="rule.inverse = !rule.inverse">{{ rule.inverse ? '不': '' }}匹配弹幕内容</span>
+                <div class="rule-box-item">
+                    <input v-model="rule.rule" class="rule-input">
+                </div>
+            </div>`
+        });
+
+        app.component('match-sender', {
+            props: {
+                rule: Object,
+                parent: Object,
+                subIndex: Number,
+                that: Object
+            },
+            template: `
+            <div class="rule-box">
+                <button class="floating-delete-button" @click="that.deleteRule(parent, subIndex, $event)">删除</button>
+                <span @click="rule.inverse = !rule.inverse">{{ rule.inverse ? '不': '' }}匹配弹幕发送者</span>
+                <div class="rule-box-item">
+                    <input v-model="rule.rule" class="rule-input">
+                </div>
+            </div>`
+        });
+
+        app.mount('#app');
+    </script>
+    <script>
+    </script>
+</body>
+</html>
