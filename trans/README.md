@@ -14,6 +14,10 @@ pip install prompt_toolkit
 chmod +x ./trans # give `trans` script executable privileges
 ./trans
 ```
+Press `<C-d>` or `<C-c>` to exit.
+
+### configuration
+No configuration files. Please change the source code directly.
 
 ### input syntax
 + Enter the sentence to be translated directly.
@@ -21,3 +25,9 @@ chmod +x ./trans # give `trans` script executable privileges
     + Spaces are not required. That's means `en => zh` and `en=>zh` are the same thing.
 + `<LANG1> => <LANG2>: <SENTENCE>` specifies the source language as `<LANG1>` and the target language as `<LANG2>` to translate `<SENTENCE>`. This approach does not change the default language settings. `<LANG1>` can be empty to indicate automatic detection.
     + Spaces are not required.
+
+### acknowledgements
++ OwO-Network/DeepLX
+
+### license
+WTFPL
