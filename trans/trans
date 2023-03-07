@@ -1,0 +1,136 @@
+#!/usr/bin/python
+import re
+import random
+import json
+import time
+import requests
+from prompt_toolkit import PromptSession
+from prompt_toolkit import print_formatted_text as pp
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.lexers import PygmentsLexer
+from prompt_toolkit.styles import Style
+from pygments.lexer import RegexLexer, bygroups
+from pygments.token import Keyword, Operator, Text, Whitespace
+
+if __name__ == '__main__':
+    random_number = round(random.random() * 10000) * 10000
+
+    def query(text: str, source_lang: str, target_lang: str) -> dict:
+        global random_number
+        random_number += 1
+        i_count = text.count('i') + 1
+        now = int(time.time() * 1000)
+        data = {
+            'jsonrpc': '2.0',
+            'method': 'LMT_handle_texts',
+            'id': random_number,
+            'params': {
+                'texts': [{'text': text, 'requestAlternatives': 3}],
+                'splitting': 'newlines',
+                'lang': {'source_lang_user_selected': source_lang, 'target_lang': target_lang},
+                'timestamp': now - now % i_count + i_count if i_count > 1 else now,
+                'commonJobParams': {'wasSpoken': False, 'transcribe_as': ''},
+            },
+        }
+        payload = json.dumps(data, separators=(',', ':')).replace(
+            'hod":"', 'hod" : "' if (random_number + 5) % 29 == 0 or (random_number + 3) % 13 == 0 else 'hod": "'
+        )
+
+        res = requests.post(
+            'https://www2.deepl.com/jsonrpc',
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': '*/*',
+                'x-app-os-name': 'iOS',
+                'x-app-os-version': '16.3.0',
+                'Accept-Language': 'zh-CN,zh-Hans;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'x-app-device': 'iPhone13,2',
+                'User-Agent': 'DeepL-iOS/2.6.0 iOS 16.3.0 (iPhone13,2)',
+                'x-app-build': '353933',
+                'x-app-version': '2.6',
+                'referer': 'https://www.deepl.com/',
+            },
+        )
+        return res.json()
+
+    class CommandLexer(RegexLexer):
+        name = 'CMD'
+        aliases = ['cmd']
+
+        tokens = {
+            'root': [
+                (
+                    r'^(\s*)(\w*)(\s*)(=>)(\s*)(\w+)(\s*)(:)(.*)$',
+                    bygroups(
+                        Whitespace, Keyword, Whitespace, Operator, Whitespace, Keyword, Whitespace, Operator, Text
+                    ),
+                ),
+                (
+                    r'^(\s*)(\w*)(\s*)(=>)(\s*)(\w+)(\s*)$',
+                    bygroups(Whitespace, Keyword, Whitespace, Operator, Whitespace, Keyword, Whitespace),
+                ),
+            ]
+        }
+
+    style = Style.from_dict(
+        {
+            'lang': 'bg:#3e4452 #61afef bold',
+            'whitespace': 'bg:#3e4452',
+            'separator': 'bg:#3e4452 #abb2bf',
+            'pound': '#3e4452',
+            'pygments.keyword': '#61afef bold',
+            'pygments.operator': '#abb2bf bold',
+            'bottom-toolbar': '#3e4452',
+            'bottom-toolbar-text': '#3e4452 bg:#abb2bf',
+            'bottom-toolbar-number': '#3e4452 bg:#61afef bold'
+        }
+    )
+
+    def bottom_toolbar():
+        return [('class:bottom-toolbar-text', 'ID: '),
+                ('class:bottom-toolbar-number', str(random_number + 1))]
+
+    session = PromptSession(lexer=PygmentsLexer(CommandLexer), style=style, bottom_toolbar=bottom_toolbar)
+    source_lang = 'auto'
+    target_lang = 'zh'
+    while True:
+        try:
+            sentence = session.prompt(
+                [
+                    ('class:whitespace', ' '),
+                    ('class:lang', source_lang),
+                    ('class:whitespace', ' '),
+                    ('class:separator', ''),
+                    ('class:whitespace', ' '),
+                    ('class:lang', target_lang),
+                    ('class:whitespace', ' '),
+                    ('class:pound', ' '),
+                ],
+                style=style,
+            )
+            # empty
+            if re.match(r'^\s*$', sentence):
+                continue
+
+            # set language
+            m = re.match(r'^\s*(\w*)\s*=>\s*(\w+)\s*$', sentence)
+            if m:
+                source_lang = m.group(1) or 'auto'
+                target_lang = m.group(2)
+                continue
+
+            m = re.match('^\s*(\w*)\s*=>\s*(\w+)\s*:\s*(.*)$', sentence)
+            res = (
+                query(m.group(3), m.group(1) or 'auto', m.group(2)) if m else query(sentence, source_lang, target_lang)
+            )
+            if 'error' in res:
+                pp(FormattedText([('red', res['error']['message'])]))
+                continue
+            print(res['result']['texts'][0]['text'])
+            pp(FormattedText([('gray', '其他方案:')]))
+            for alt in res['result']['texts'][0]['alternatives']:
+                print(alt["text"])
+        except EOFError:
+            break
