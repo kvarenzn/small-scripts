@@ -128,10 +128,13 @@ if __name__ == '__main__':
             if 'error' in res:
                 pp(FormattedText([('red', res['error']['message'])]))
                 continue
-            print(res['result']['texts'][0]['text'])
-            pp(FormattedText([('gray', '其他方案:')]))
-            for alt in res['result']['texts'][0]['alternatives']:
-                print(alt["text"])
+            text = res['result']['texts'][0]
+            print(text['text'])
+            alternatives = text['alternatives']
+            if alternatives:
+                pp(FormattedText([('gray', 'Alternatives:')]))
+                for alt in alternatives:
+                    print(alt["text"])
         except EOFError:
             break
         except KeyboardInterrupt:
