@@ -67,3 +67,7 @@
 # huggingface
 127.0.0.1 huggingface.co www.huggingface.co
 ```
+
+## 声明&致谢
++ `nginx.conf`这份配置基于[mashirozx/Pixiv-Nginx](https://github.com/mashirozx/Pixiv-Nginx)的旧版本`nginx.conf`修改而来（当时基于的版本只包含pixiv和wikipedia相关配置），微调了一部分设置并加入了其他网站的配置
++ 感谢 @mashirozx 大佬的无私奉献
